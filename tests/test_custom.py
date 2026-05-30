@@ -452,3 +452,112 @@ class TestFeeOnlyTrailingDates:
         assert r.feasible is True
         # All rows should have creditor payments (no fee-only trailing)
         assert all(row.creditor_payment_cents > 0 for row in r.schedule)
+
+
+# ---------------------------------------------------------------------------
+# Additional edge cases
+# ---------------------------------------------------------------------------
+
+class TestEdgeCases:
+    def test_first_payment_date_omitted_defaults_to_eom(self):
+        """When first_payment_date is None, defaults to EOM of first_draft_date."""
+        client = _make_client(draft=20000, first="2026-03-01", last="2026-09-01")
+        offer = Offer("DefaultCo", 60000, 60000, 0.5, None)  # no first_payment_date
+        rules = _make_rules(max_payments=6, even=True, bank_fee=0, fee_pct=0.0)
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        # First payment should be EOM of March = Mar 31
+        assert r.schedule[0].date == date(2026, 3, 31)
+
+    def test_different_max_terms_and_max_payments(self):
+        """When max_terms != max_payments, use min(both)."""
+        client = _make_client(draft=20000, last="2026-07-01")
+        offer = _make_offer(creditor_bal=60000, original_bal=60000, pct=0.5)
+        # max_terms=10 but max_payments=3 → k ≤ 3
+        rules = _make_rules(max_terms=10, max_payments=3, even=True, bank_fee=0, fee_pct=0.0)
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        assert len(r.schedule) <= 3
+
+    def test_balloon_rejected_when_balloon_less_than_previous(self):
+        """Balloon is rejected if final payment would be less than previous."""
+        # offer_total very small, k large → balloon would be tiny
+        client = _make_client(draft=20000, last="2026-07-01")
+        # total = 5000, k=3, floors=[2500, 2500, ?], balloon = 5000-2500-2500 = 0 < 2500
+        offer = _make_offer(creditor_bal=10000, original_bal=10000, pct=0.5)
+        rules = _make_rules(max_payments=3, balloon=True, bank_fee=0, fee_pct=0.0, min_pay=2500)
+        r = evaluate_offer(client, offer, rules)
+        # k=3 balloon fails (balloon=0 < 2500), but k=2 works: [2500, 2500]
+        assert r.feasible is True
+        payments = [row.creditor_payment_cents for row in r.schedule]
+        assert sum(payments) == 5000
+
+    def test_offer_total_less_than_k_times_min(self):
+        """When offer_total < k * min_payment, that k is skipped."""
+        client = _make_client(draft=20000, last="2026-07-01")
+        # total = 5000, min_pay = 2500, max_payments = 6
+        # k=3,4,5,6 all need at least k*2500 > 5000. Only k=1 or k=2 work.
+        offer = _make_offer(creditor_bal=10000, original_bal=10000, pct=0.5)
+        rules = _make_rules(max_payments=6, even=True, bank_fee=0, fee_pct=0.0, min_pay=2500)
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        assert len(r.schedule) == 2  # k=2: [2500, 2500]
+
+    def test_even_pays_with_tier_forces_smaller_k(self):
+        """Even pays + tier floor forces k down until even amount >= tier."""
+        client = _make_client(draft=20000, last="2027-01-01")
+        # total = 50000, tier at pos 1 = 10000. Even payment must be >= 10000.
+        # 50000/k >= 10000 → k <= 5
+        offer = _make_offer(creditor_bal=100000, original_bal=100000, pct=0.5)
+        rules = _make_rules(max_payments=12, even=True, bank_fee=0, fee_pct=0.0,
+                            min_pay=2500, tiers=[[1, 10000]])
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        payments = [row.creditor_payment_cents for row in r.schedule]
+        assert all(p >= 10000 for p in payments)
+        assert len(payments) <= 5
+
+    def test_existing_debit_in_ledger(self):
+        """Existing debits (other settled debts) reduce available balance."""
+        client = _make_client(draft=20000, last="2026-07-01",
+                              extra_debits=[("2026-01-31", 15000)])
+        offer = _make_offer(creditor_bal=60000, original_bal=60000, pct=0.5)
+        rules = _make_rules(max_payments=6, even=True, bank_fee=0, fee_pct=0.0)
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        # Balance on Jan 31 is reduced by the 15000 debit
+        assert r.schedule[0].balance_cents >= 0
+
+    def test_max_segments_three(self):
+        """Staircase with max_segments=3 can use three distinct levels."""
+        client = _make_client(draft=10000, last="2027-01-01")
+        offer = _make_offer(creditor_bal=100000, original_bal=100000, pct=0.5)
+        rules = _make_rules(max_payments=12, max_seg=3, bank_fee=0, fee_pct=0.0,
+                            min_pay=2500, tiers=[[7, 5000]])
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        payments = [row.creditor_payment_cents for row in r.schedule]
+        assert len(set(payments)) <= 3
+        assert payments == sorted(payments)  # non-decreasing
+
+    def test_eom_cadence_feb_handling(self):
+        """EOM cadence correctly handles Jan 31 → Feb 28."""
+        client = Client(
+            draft_amount_cents=20000, draft_day=1,
+            first_draft_date=date(2026, 1, 1), last_draft_date=date(2026, 4, 1),
+            as_of_date=date(2025, 12, 31), current_balance_cents=0,
+            ledger=[
+                LedgerEntry(date(2026, 1, 1), 20000, "credit"),
+                LedgerEntry(date(2026, 2, 1), 20000, "credit"),
+                LedgerEntry(date(2026, 3, 1), 20000, "credit"),
+                LedgerEntry(date(2026, 4, 1), 20000, "credit"),
+            ],
+        )
+        offer = Offer("EOMCo", 30000, 30000, 0.5, date(2026, 1, 31))  # EOM start
+        rules = _make_rules(max_payments=3, even=True, bank_fee=0, fee_pct=0.0, min_pay=2500)
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        # Dates should be Jan 31, Feb 28, Mar 31 (EOM cadence)
+        assert r.schedule[0].date == date(2026, 1, 31)
+        assert r.schedule[1].date == date(2026, 2, 28)
+        assert r.schedule[2].date == date(2026, 3, 31)
