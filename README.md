@@ -106,6 +106,12 @@ In balloon mode, the first k-1 payments respect both the token-pay cap and tier 
 - The lump sum is injected on the earliest future credit date (first draft after `as_of_date`), since earlier cash is weakly more useful.
 - The monthly increment is added to every ledger credit entry after `as_of_date`.
 - Rounding uses explicit round-half-up (`math.floor(x + 0.5)`) as required by the spec, not Python's default banker's rounding.
+- Greedy fee allocation (take max fee each date, earliest first) is provably optimal for front-loading — there is no benefit to deferring fee collection to a later date.
+- Larger `k` is tried first: more payments = smaller per-payment amounts = more room for fee. This is a heuristic; in rare edge cases a smaller `k` might allow better fee timing.
+- For staircase with `max_segments=2`, the high-level segment must divide evenly (all payments in that segment are the same integer). Splits that don't divide exactly are skipped.
+- Fee-only trailing dates follow the same monthly cadence as creditor-payment dates (same day-of-month or EOM pattern).
+- Binary search for minimum funds assumes monotonicity: more money (lump or monthly) never makes a feasible schedule infeasible.
+- No fee is allocated before the first creditor payment date; the same date is allowed.
 
 ### Fee-only trailing dates
 
