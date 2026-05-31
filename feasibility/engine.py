@@ -469,10 +469,12 @@ def _front_load_fee(
     total_fee: int,
     bank_fee: int,
 ) -> list[int] | None:
-    """Greedily allocate program fee to earliest dates. Returns fee per date or None if can't fit."""
+    """Allocate program fee with look-ahead: take max fee that won't break future dates."""
+    if total_fee == 0:
+        return [0] * len(payment_dates)
+
     horizon = client.last_draft_date
 
-    # Build credit/debit maps for ledger entries after as_of_date
     credits_by_date: dict[date, int] = defaultdict(int)
     debits_by_date: dict[date, int] = defaultdict(int)
 
@@ -483,40 +485,57 @@ def _front_load_fee(
             else:
                 debits_by_date[entry.date] += entry.amount_cents
 
-    # Collect all dates chronologically
     all_dates = set()
     all_dates.update(credits_by_date.keys())
     all_dates.update(debits_by_date.keys())
     all_dates.update(payment_dates)
     all_dates = sorted(d for d in all_dates if d > client.as_of_date and d <= horizon)
 
-    # Simulate forward, greedily assigning fee on payment dates
-    balance = client.current_balance_cents
-    fee_remaining = total_fee
-    fee_allocation = [0] * len(payment_dates)
     payment_date_index = {d: i for i, d in enumerate(payment_dates)}
 
+    # Pass 1: compute balance at each date WITHOUT any fee
+    balance = client.current_balance_cents
+    balance_at = []  # balance at each date in all_dates (no fee deducted)
     for d in all_dates:
-        # Credits first
         balance += credits_by_date.get(d, 0)
-        # Existing debits
         balance -= debits_by_date.get(d, 0)
-
         if d in payment_date_index:
             idx = payment_date_index[d]
-            # Deduct creditor payment and bank fee
             b_fee = bank_fee if payments[idx] > 0 else 0
             balance -= payments[idx]
             balance -= b_fee
-            # Greedily take fee
-            can_take = min(fee_remaining, balance)
+        balance_at.append(balance)
+
+    # Check if even without fee the balance goes negative
+    if any(b < 0 for b in balance_at):
+        return None
+
+    # Pass 2: compute suffix minimum (min future balance from each position onward)
+    n = len(all_dates)
+    suffix_min = [0] * n
+    suffix_min[n - 1] = balance_at[n - 1]
+    for i in range(n - 2, -1, -1):
+        suffix_min[i] = min(balance_at[i], suffix_min[i + 1])
+
+    # Pass 3: allocate fee greedily, limited by suffix minimum (look-ahead)
+    fee_remaining = total_fee
+    fee_allocation = [0] * len(payment_dates)
+    total_fee_taken = 0  # cumulative fee taken so far
+
+    for i, d in enumerate(all_dates):
+        if d in payment_date_index and fee_remaining > 0:
+            idx = payment_date_index[d]
+            # Current effective balance = balance_at[i] - total_fee_taken
+            current_bal = balance_at[i] - total_fee_taken
+            # Future minimum effective balance = suffix_min[i] - total_fee_taken
+            # If we take X more, all future balances drop by X
+            # Need: (suffix_min from i onward) - total_fee_taken - X >= 0
+            future_min = suffix_min[i] - total_fee_taken
+            can_take = min(fee_remaining, current_bal, future_min)
             can_take = max(can_take, 0)
             fee_allocation[idx] = can_take
             fee_remaining -= can_take
-            balance -= can_take
-
-        if balance < 0:
-            return None
+            total_fee_taken += can_take
 
     if fee_remaining > 0:
         return None

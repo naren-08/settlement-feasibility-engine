@@ -561,3 +561,32 @@ class TestEdgeCases:
         assert r.schedule[0].date == date(2026, 1, 31)
         assert r.schedule[1].date == date(2026, 2, 28)
         assert r.schedule[2].date == date(2026, 3, 31)
+
+    def test_lookahead_prevents_over_greedy_fee(self):
+        """Look-ahead fee allocation doesn't drain balance needed for future creditor payments."""
+        # Scenario: balloon with big final payment. Greedy would take too much fee early,
+        # causing the final payment to fail. Look-ahead limits fee to keep future solvent.
+        client = Client(
+            draft_amount_cents=8000, draft_day=1,
+            first_draft_date=date(2026, 1, 1), last_draft_date=date(2026, 5, 1),
+            as_of_date=date(2025, 12, 31), current_balance_cents=0,
+            ledger=[
+                LedgerEntry(date(2026, 1, 1), 8000, "credit"),
+                LedgerEntry(date(2026, 2, 1), 8000, "credit"),
+                LedgerEntry(date(2026, 3, 1), 8000, "credit"),
+                LedgerEntry(date(2026, 4, 1), 8000, "credit"),
+                LedgerEntry(date(2026, 5, 1), 8000, "credit"),
+            ],
+        )
+        # offer_total = 20000, balloon: [2500, 2500, 15000]
+        offer = Offer("LookCo", 40000, 40000, 0.5, date(2026, 1, 31))
+        rules = _make_rules(max_payments=3, balloon=True, bank_fee=0, fee_pct=0.2, min_pay=2500)
+        # fee = 0.2 * 40000 = 8000
+        # Without look-ahead: Jan 31 balance=5500, greedy takes 5500 fee → future breaks
+        # With look-ahead: limits fee to keep Mar 31 solvent
+        r = evaluate_offer(client, offer, rules)
+        assert r.feasible is True
+        assert all(row.balance_cents >= 0 for row in r.schedule)
+        # Fee should be fully collected
+        total_fee = sum(row.program_fee_cents for row in r.schedule)
+        assert total_fee == 8000
