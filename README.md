@@ -81,7 +81,7 @@ When infeasible, binary search finds the minimum lump sum and minimum monthly in
 
 - **LP/constraint solver (e.g. ortools):** Would give optimal fee allocation but adds a dependency and complexity for a problem solvable with greedy + enumeration.
 - **Bottom-up (try k=1 first):** Rejected because smaller k means larger payments that crowd out early fee collection.
-- **Exact fee optimization per k:** The greedy approach (take max fee each date) is provably optimal for front-loading since fee has no ordering constraint beyond "not before first payment."
+- **Naive greedy fee allocation:** Takes max fee on each date without checking future impact. Can over-drain the balance, causing a later creditor payment to fail. Replaced with look-ahead approach.
 
 ### Payment shape interpretation
 
@@ -106,7 +106,7 @@ In balloon mode, the first k-1 payments respect both the token-pay cap and tier 
 - The lump sum is injected on the earliest future credit date (first draft after `as_of_date`), since earlier cash is weakly more useful.
 - The monthly increment is added to every ledger credit entry after `as_of_date`.
 - Rounding uses explicit round-half-up (`math.floor(x + 0.5)`) as required by the spec, not Python's default banker's rounding.
-- Greedy fee allocation (take max fee each date, earliest first) is provably optimal for front-loading — there is no benefit to deferring fee collection to a later date.
+- Fee allocation uses look-ahead with suffix minimum: takes the maximum fee on each date that won't cause any future date to go negative. This is provably optimal for front-loading while maintaining feasibility.
 - Larger `k` is tried first: more payments = smaller per-payment amounts = more room for fee. This is a heuristic; in rare edge cases a smaller `k` might allow better fee timing.
 - For staircase with `max_segments=2`, the high-level segment must divide evenly (all payments in that segment are the same integer). Splits that don't divide exactly are skipped.
 - Fee-only trailing dates follow the same monthly cadence as creditor-payment dates (same day-of-month or EOM pattern).
@@ -120,6 +120,18 @@ The solver uses a two-pass approach for fee allocation:
 2. **Pass 2 (fallback):** If fee can't fit, extend with fee-only trailing cadence dates after the last creditor payment, up to the horizon. These dates carry only fee (no creditor payment, no bank fee).
 
 This ensures the fee is front-loaded as aggressively as possible, while avoiding false "infeasible" verdicts when the fee simply needs one or two extra months to be collected.
+
+### Fee allocation algorithm (look-ahead with suffix minimum)
+
+The fee allocator uses a look-ahead approach instead of naive greedy to prevent over-draining the balance:
+
+1. **Compute balances without fee** — simulate the full timeline with only creditor payments and bank fees (no fee deducted). This gives `balance_at[i]` for each date.
+2. **Build suffix minimum** — `suffix_min[i] = min(balance_at[i], balance_at[i+1], ..., balance_at[n-1])`. This tells us the lowest the balance will ever be from date `i` onward.
+3. **Allocate fee** — at each payment date, take `min(fee_remaining, balance_at[i] - fee_taken_so_far, suffix_min[i] - fee_taken_so_far)`. This guarantees no future date goes negative.
+
+**Complexity:** O(n) for all three passes — the suffix minimum replaces an O(n²) "scan all future dates" approach.
+
+**Why not pure greedy?** Greedy takes max fee on each date without considering future impact. With a large balloon payment later, greedy can drain the balance early, causing the balloon date to go negative. The suffix minimum prevents this by limiting fee to what the future can sustain.
 
 ### Known edge cases / limitations
 
